@@ -1,0 +1,1416 @@
+---
+title: "clusterBMA_reviewer_additions"
+author: "Owen Forbes"
+date: "06/01/2023"
+output: html_document
+---
+
+
+
+```{r setup, include=FALSE}
+library(clusterBMA) #v0.2.0
+library(diceR) #v1.2.2 for consensus clustering - CSPA, majority voting, etc
+
+library(tidyverse) #v1.3.2 for data cleaning/piping etc
+
+
+library(clusterGeneration)#v1.3.7 for simulated data
+
+
+library(pdfCluster) #v1.0-4 for adjusted Rand index
+
+```
+
+
+
+# IMPLEMENTING FOR COMPARISON OF clusterBMA and diceR ensemble methods...
+
+1. use consensus_cluster() to calculate variety of clustering results (9 algs), using p.item =1 to not do subsampling
+
+2. calculate consensus using diff methods: LCA(), LCE(), majority_voting(), k_modes(), CSPA()
+
+3. apply clusterBMA
+
+4. compare
+- % correctly recovered labels (accuracy results)
+--> ADJUSTED RAND INDEX
+- accuracy results for cBMA allocations with uncertainty <30%? (or some other threshold)
+- additional information gained
+
+
+# ALGORITHM OUTPUTS (hard or soft?) from diceR
+
+
+# 9 ALGORITHMS
+
+# looking under the hood at algos
+
+
+#HC = hard
+
+as.integer(stats::cutree(stats::hclust(d, method = method), 
+        k))
+        
+#DIANA = hard
+ as.integer(stats::cutree(cluster::diana(d, diss = TRUE), 
+            k))
+
+#PAM = hard
+as.integer(cluster::pam(d, k, cluster.only = TRUE))
+
+#k-means = hard
+as.integer(stats::kmeans(x, k)$cluster)
+
+#ap Affinity Propagation = has probabilistic interpretation available, but for all intents and purposes it's hard allocation... 
+#see http://genes.toronto.edu/affinitypropagation/faq.html
+# Is there a probabilistic interpretation of affinity propagation?
+
+suppressWarnings(apcluster::apclusterK(apcluster::negDistMat, 
+            x, k, verbose = FALSE)@idx) %>% dplyr::dense_rank() %>% 
+            purrr::when(length(.) > 0 ~ ., ~NA)
+
+
+# sc Spectral clustering = hard
+kernlab::specc(as.matrix(x), k, kernel = "rbfdot")@.Data
+
+        
+
+#GMM = soft
+
+# If wanting to use within-method uncertainty/probabilistic cluster allocation, need to generate gmm from mclust::Mclust
+mclust::Mclust(x, k, verbose = FALSE)$classification
+
+
+--------
+
+
+# SIMULATION STUDY 1
+
+
+```{r}
+
+
+
+simul_data_2d <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.2,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(200,3)),numReplicate = 1,clustszind = 3)
+simul_2d_df <- simul_data_2d$datList$test_1
+simul_2d_labels <- simul_data_2d$memList$test_1
+
+simul_data_10d <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.2,numNonNoisy=10,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 1,clustszind = 3)
+simul_10d_df <- simul_data_10d$datList$test_1
+simul_10d_labels <- simul_data_10d$memList$test_1
+
+
+simul_data_50d <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.2,numNonNoisy=50,numNoisy=0,clustSizes=c(rep(200,3)),numReplicate = 1,clustszind = 3)
+simul_50d_df <- simul_data_50d$datList$test_1
+simul_50d_labels <- simul_data_50d$memList$test_1
+
+# 
+# sim_data_1_10_50_190123 <- list(simul_data_2d,simul_data_10d,simul_data_50d)
+# save(sim_data_1_10_50_190123,file="sim_data_1_10_50_190123")
+
+load("sim_data_1_10_50_190123")
+
+simul_data_2d <- sim_data_1_10_50_190123[[1]]
+simul_data_10d <- sim_data_1_10_50_190123[[2]]
+simul_data_50d <- sim_data_1_10_50_190123[[3]]
+
+simul_2d_df <- simul_data_2d$datList$test_1
+simul_2d_labels <- simul_data_2d$memList$test_1
+
+simul_10d_df <- simul_data_10d$datList$test_1
+simul_10d_labels <- simul_data_10d$memList$test_1
+
+simul_50d_df <- simul_data_50d$datList$test_1
+simul_50d_labels <- simul_data_50d$memList$test_1
+
+ 
+plot(simul_2d_df)
+
+
+```
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# 2 dimensional sim
+
+
+```{r}
+
+
+
+diceR_clusters_2d <- diceR::consensus_cluster(data=simul_2d_df,nk=3,p.item=1, algorithms = c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans"), reps = 1) #having issues with nmf and block - chucking
+
+CSPA_output_2d <- CSPA(diceR_clusters_2d,k=3)
+
+LCA_output_2d <- LCA(diceR_clusters_2d, is.relabelled = F)
+
+LCE_output_2d <- LCE(as.matrix(diceR_clusters_2d[,1,,1]), k=3, sim.mat="cts")
+
+
+k_modes_output_2d <- k_modes(diceR_clusters_2d, is.relabelled = F)
+
+majority_voting_output_2d <- majority_voting(diceR_clusters_2d, is.relabelled = F)
+
+```
+
+
+# ALGORITHM OUTPUTS (hard or soft?) from diceR
+
+
+
+
+```{r}
+#algorithms = c("hc", "diana", "km", "pam", "ap", "sc","gmm", "som", "cmeans")
+
+# CHUCKED NMF AND BLOCK which were having issues with weights (XB) and NAs
+#nmf_brunet_probs <- hard_to_prob_fn(cluster_labs_diceR[,1],n_clust=3)
+#nmf_lee_probs <- hard_to_prob_fn(cluster_labs_diceR[,2],n_clust=3)
+#block_probs <- hard_to_prob_fn(cluster_labs_diceR[,10],n_clust=3)
+
+
+
+cluster_labs_diceR_2d <- as.matrix(diceR_clusters_2d[,1,,1])
+
+hc_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,1],n_clust=3)
+diana_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,2],n_clust=3)
+km_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,3],n_clust=3)
+pam_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,4],n_clust=3)
+ap_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,5],n_clust=3)
+sc_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,6],n_clust=3)
+gmm_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,7],n_clust=3)
+som_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,8],n_clust=3)
+cmeans_probs_2d <- hard_to_prob_fn(cluster_labs_diceR_2d[,9],n_clust=3)
+
+
+list_of_probs_2d <- list(hc_probs_2d,diana_probs_2d,km_probs_2d,pam_probs_2d,ap_probs_2d,sc_probs_2d,gmm_probs_2d,som_probs_2d,cmeans_probs_2d)
+
+cBMA_output_2d <- clusterBMA::clusterBMA(input_data = simul_2d_df,cluster_prob_matrices = list_of_probs_2d,n_final_clust = 3,wt_crit_name = "Calinski_Harabasz",wt_crit_direction = "max")
+cBMA_output_2d
+#cBMA_output_2d_sdbw <- clusterBMA::clusterBMA(input_data = simul_2d_df,cluster_prob_matrices = list_of_probs_2d,n_final_clust = 3,wt_crit_name = "S_Dbw",wt_crit_direction = "min")
+
+
+
+cBMA_output_2d[[3]]
+cBMA_output_2d[[5]]
+
+#cBMA_output_2d_sdbw[[5]]
+#cBMA_output_2d[[5]]
+```
+
+
+# Combining outputs all into one DF
+
+```{r}
+
+true_labs_2d <- simul_2d_labels
+
+plotting_df_2d <- data.frame(cbind(simul_2d_df,CSPA_output_2d,LCA_output_2d,LCE_output_2d,k_modes_output_2d,majority_voting_output_2d,cBMA_output_2d[[3]]$alloc_ordered,cBMA_output_2d[[3]]$alloc_prob,true_labs_2d))
+# 
+# names(plotting_df)
+# length(plotting_df)
+# plotting_df[,4:8] <- lapply(plotting_df[,4:8],as.factor)
+
+names(plotting_df_2d)[ncol(plotting_df_2d)-2] <- "clusterBMA_output_2d" 
+names(plotting_df_2d)[ncol(plotting_df_2d)-1] <- "clusterBMA_probs_2d" 
+
+#view(plotting_df)
+```
+
+
+# comparing accuracy using Adjusted RAnd Index
+
+```{r}
+library(pdfCluster)
+
+names(plotting_df_2d)
+
+
+# CSPA
+ARI_CSPA_2d <- pdfCluster::adj.rand.index(plotting_df_2d$CSPA_output_2d,plotting_df_2d$true_labs_2d)
+
+
+# LCA
+ARI_LCA_2d <- pdfCluster::adj.rand.index(plotting_df_2d$LCA_output_2d,plotting_df_2d$true_labs_2d)
+
+# LCE
+ARI_LCE_2d <- pdfCluster::adj.rand.index(plotting_df_2d$LCE_output_2d,plotting_df_2d$true_labs_2d)
+
+
+# k_modes
+ARI_k_modes_2d <- pdfCluster::adj.rand.index(plotting_df_2d$k_modes_output_2d,plotting_df_2d$true_labs_2d)
+
+
+# majority_voting
+ARI_majority_voting_2d <- pdfCluster::adj.rand.index(plotting_df_2d$majority_voting_output_2d,plotting_df_2d$true_labs_2d)
+
+
+# clusterBMA
+ARI_clusterBMA_2d <- pdfCluster::adj.rand.index(plotting_df_2d$clusterBMA_output_2d,plotting_df_2d$true_labs_2d)
+
+
+highcertainty_threshold <- 0.8
+ARI_clusterBMA_highcertainty_2d <- pdfCluster::adj.rand.index(plotting_df_2d$clusterBMA_output_2d[cBMA_output_2d[[3]]$alloc_prob>highcertainty_threshold],plotting_df_2d$true_labs_2d[cBMA_output_2d[[3]]$alloc_prob>highcertainty_threshold])
+
+ARI_CSPA_2d
+ARI_LCA_2d
+ARI_LCE_2d
+ARI_k_modes_2d
+ARI_majority_voting_2d
+ARI_clusterBMA_2d
+ARI_clusterBMA_highcertainty_2d
+
+
+# how many high-certainty (>90% alloc prob) allocations?
+
+sum(cBMA_output_2d[[3]]$alloc_prob>highcertainty_threshold) #569/600
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# 10 dimensional sim
+
+
+```{r}
+
+
+
+diceR_clusters_10d <- diceR::consensus_cluster(data=simul_10d_df,nk=3,p.item=1, algorithms = c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans"), reps = 1) #having issues with nmf and block - chucking
+
+CSPA_output_10d <- CSPA(diceR_clusters_10d,k=3)
+
+LCA_output_10d <- LCA(diceR_clusters_10d, is.relabelled = F)
+
+LCE_output_10d <- LCE(as.matrix(diceR_clusters_10d[,1,,1]), k=3, sim.mat="cts")
+
+
+k_modes_output_10d <- k_modes(diceR_clusters_10d, is.relabelled = F)
+
+majority_voting_output_10d <- majority_voting(diceR_clusters_10d, is.relabelled = F)
+
+```
+
+
+# ALGORITHM OUTPUTS (hard or soft?) from diceR
+
+
+
+
+```{r}
+#algorithms = c("hc", "diana", "km", "pam", "ap", "sc","gmm", "som", "cmeans")
+
+# CHUCKED NMF AND BLOCK which were having issues with weights (XB) and NAs
+#nmf_brunet_probs <- hard_to_prob_fn(cluster_labs_diceR[,1],n_clust=3)
+#nmf_lee_probs <- hard_to_prob_fn(cluster_labs_diceR[,2],n_clust=3)
+#block_probs <- hard_to_prob_fn(cluster_labs_diceR[,10],n_clust=3)
+
+
+
+cluster_labs_diceR_10d <- as.matrix(diceR_clusters_10d[,1,,1])
+
+hc_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,1],n_clust=3)
+diana_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,2],n_clust=3)
+km_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,3],n_clust=3)
+pam_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,4],n_clust=3)
+ap_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,5],n_clust=3)
+sc_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,6],n_clust=3)
+gmm_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,7],n_clust=3)
+som_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,8],n_clust=3)
+cmeans_probs_10d <- hard_to_prob_fn(cluster_labs_diceR_10d[,9],n_clust=3)
+
+
+list_of_probs_10d <- list(hc_probs_10d,diana_probs_10d,km_probs_10d,pam_probs_10d,ap_probs_10d,sc_probs_10d,gmm_probs_10d,som_probs_10d,cmeans_probs_10d)
+
+cBMA_output_10d <- clusterBMA::clusterBMA(input_data = simul_10d_df,cluster_prob_matrices = list_of_probs_10d,n_final_clust = 3,wt_crit_name = "Calinski_Harabasz",wt_crit_direction = "max")
+cBMA_output_10d
+
+cBMA_output_10d[[3]]
+cBMA_output_10d[[5]]
+```
+
+
+# Combining outputs all into one DF
+
+```{r}
+
+true_labs_10d <- simul_10d_labels
+
+plotting_df_10d <- data.frame(cbind(simul_10d_df,CSPA_output_10d,LCA_output_10d,LCE_output_10d,k_modes_output_10d,majority_voting_output_10d,cBMA_output_10d[[3]]$alloc_ordered,cBMA_output_10d[[3]]$alloc_prob,true_labs_10d))
+# 
+# names(plotting_df)
+# length(plotting_df)
+# plotting_df[,4:8] <- lapply(plotting_df[,4:8],as.factor)
+
+names(plotting_df_10d)[ncol(plotting_df_10d)-2] <- "clusterBMA_output_10d" 
+names(plotting_df_10d)[ncol(plotting_df_10d)-1] <- "clusterBMA_probs_10d" 
+
+#view(plotting_df)
+```
+
+
+# comparing accuracy using Adjusted RAnd Index
+
+```{r}
+library(pdfCluster)
+
+names(plotting_df_10d)
+
+
+# CSPA
+ARI_CSPA_10d <- pdfCluster::adj.rand.index(plotting_df_10d$CSPA_output_10d,plotting_df_10d$true_labs_10d)
+
+
+# LCA
+ARI_LCA_10d <- pdfCluster::adj.rand.index(plotting_df_10d$LCA_output_10d,plotting_df_10d$true_labs_10d)
+
+# LCE
+ARI_LCE_10d <- pdfCluster::adj.rand.index(plotting_df_10d$LCE_output_10d,plotting_df_10d$true_labs_10d)
+
+
+# k_modes
+ARI_k_modes_10d <- pdfCluster::adj.rand.index(plotting_df_10d$k_modes_output_10d,plotting_df_10d$true_labs_10d)
+
+
+# majority_voting
+ARI_majority_voting_10d <- pdfCluster::adj.rand.index(plotting_df_10d$majority_voting_output_10d,plotting_df_10d$true_labs_10d)
+
+
+# clusterBMA
+ARI_clusterBMA_10d <- pdfCluster::adj.rand.index(plotting_df_10d$clusterBMA_output_10d,plotting_df_10d$true_labs_10d)
+
+
+highcertainty_threshold <- 0.8
+ARI_clusterBMA_highcertainty_10d <- pdfCluster::adj.rand.index(plotting_df_10d$clusterBMA_output_10d[cBMA_output_10d[[3]]$alloc_prob>highcertainty_threshold],plotting_df_10d$true_labs_10d[cBMA_output_10d[[3]]$alloc_prob>highcertainty_threshold])
+
+ARI_CSPA_10d
+ARI_LCA_10d
+ARI_LCE_10d
+ARI_k_modes_10d
+ARI_majority_voting_10d
+ARI_clusterBMA_10d
+ARI_clusterBMA_highcertainty_10d
+
+
+# how many high-certainty (>90% alloc prob) allocations?
+
+sum(cBMA_output_10d[[3]]$alloc_prob>highcertainty_threshold) #557/600
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# 50 dimensional sim
+
+
+```{r}
+
+
+
+diceR_clusters_50d <- diceR::consensus_cluster(data=simul_50d_df,nk=3,p.item=1, algorithms = c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans"), reps = 1) #having issues with nmf and block - chucking
+
+CSPA_output_50d <- CSPA(diceR_clusters_50d,k=3)
+
+LCA_output_50d <- LCA(diceR_clusters_50d, is.relabelled = F)
+
+LCE_output_50d <- LCE(as.matrix(diceR_clusters_50d[,1,,1]), k=3, sim.mat="cts")
+
+
+k_modes_output_50d <- k_modes(diceR_clusters_50d, is.relabelled = F)
+
+majority_voting_output_50d <- majority_voting(diceR_clusters_50d, is.relabelled = F)
+
+```
+
+
+# ALGORITHM OUTPUTS (hard or soft?) from diceR
+
+
+
+
+```{r}
+#algorithms = c("hc", "diana", "km", "pam", "ap", "sc","gmm", "som", "cmeans")
+
+# CHUCKED NMF AND BLOCK which were having issues with weights (XB) and NAs
+#nmf_brunet_probs <- hard_to_prob_fn(cluster_labs_diceR[,1],n_clust=3)
+#nmf_lee_probs <- hard_to_prob_fn(cluster_labs_diceR[,2],n_clust=3)
+#block_probs <- hard_to_prob_fn(cluster_labs_diceR[,10],n_clust=3)
+
+
+
+cluster_labs_diceR_50d <- as.matrix(diceR_clusters_50d[,1,,1])
+
+hc_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,1],n_clust=3)
+diana_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,2],n_clust=3)
+km_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,3],n_clust=3)
+pam_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,4],n_clust=3)
+ap_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,5],n_clust=3)
+sc_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,6],n_clust=3)
+gmm_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,7],n_clust=3)
+som_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,8],n_clust=3)
+cmeans_probs_50d <- hard_to_prob_fn(cluster_labs_diceR_50d[,9],n_clust=3)
+
+
+list_of_probs_50d <- list(hc_probs_50d,diana_probs_50d,km_probs_50d,pam_probs_50d,ap_probs_50d,sc_probs_50d,gmm_probs_50d,som_probs_50d,cmeans_probs_50d)
+
+cBMA_output_50d <- clusterBMA::clusterBMA(input_data = simul_50d_df,cluster_prob_matrices = list_of_probs_50d,n_final_clust = 3,wt_crit_name = "Calinski_Harabasz",wt_crit_direction = "max")
+cBMA_output_50d
+
+cBMA_output_50d[[3]]
+cBMA_output_50d[[5]]
+```
+
+
+# Combining outputs all into one DF
+
+```{r}
+
+true_labs_50d <- simul_50d_labels
+
+plotting_df_50d <- data.frame(cbind(simul_50d_df,CSPA_output_50d,LCA_output_50d,LCE_output_50d,k_modes_output_50d,majority_voting_output_50d,cBMA_output_50d[[3]]$alloc_ordered,cBMA_output_50d[[3]]$alloc_prob,true_labs_50d))
+# 
+# names(plotting_df)
+# length(plotting_df)
+# plotting_df[,4:8] <- lapply(plotting_df[,4:8],as.factor)
+
+names(plotting_df_50d)[ncol(plotting_df_50d)-2] <- "clusterBMA_output_50d" 
+names(plotting_df_50d)[ncol(plotting_df_50d)-1] <- "clusterBMA_probs_50d" 
+
+#view(plotting_df)
+```
+
+
+# comparing accuracy using Adjusted RAnd Index
+
+```{r}
+library(pdfCluster)
+
+names(plotting_df_50d)
+
+
+# CSPA
+ARI_CSPA_50d <- pdfCluster::adj.rand.index(plotting_df_50d$CSPA_output_50d,plotting_df_50d$true_labs_50d)
+
+
+# LCA
+ARI_LCA_50d <- pdfCluster::adj.rand.index(plotting_df_50d$LCA_output_50d,plotting_df_50d$true_labs_50d)
+
+# LCE
+ARI_LCE_50d <- pdfCluster::adj.rand.index(plotting_df_50d$LCE_output_50d,plotting_df_50d$true_labs_50d)
+
+
+# k_modes
+ARI_k_modes_50d <- pdfCluster::adj.rand.index(plotting_df_50d$k_modes_output_50d,plotting_df_50d$true_labs_50d)
+
+
+# majority_voting
+ARI_majority_voting_50d <- pdfCluster::adj.rand.index(plotting_df_50d$majority_voting_output_50d,plotting_df_50d$true_labs_50d)
+
+
+# clusterBMA
+ARI_clusterBMA_50d <- pdfCluster::adj.rand.index(plotting_df_50d$clusterBMA_output_50d,plotting_df_50d$true_labs_50d)
+
+
+highcertainty_threshold <- 0.8
+ARI_clusterBMA_highcertainty_50d <- pdfCluster::adj.rand.index(plotting_df_50d$clusterBMA_output_50d[cBMA_output_50d[[3]]$alloc_prob>highcertainty_threshold],plotting_df_50d$true_labs_50d[cBMA_output_50d[[3]]$alloc_prob>highcertainty_threshold])
+
+ARI_CSPA_50d
+ARI_LCA_50d
+ARI_LCE_50d
+ARI_k_modes_50d
+ARI_majority_voting_50d
+ARI_clusterBMA_50d
+ARI_clusterBMA_highcertainty_50d
+
+
+# how many high-certainty (>90% alloc prob) allocations?
+
+sum(cBMA_output_50d[[3]]$alloc_prob>highcertainty_threshold) #485/600
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# PIPELINE to generate 10 simulated datasets for each n. dimensions (2,10,50) and compare results from ensemble methods, saving ARI from each 10...
+
+1. Generate 3 lists of 10 x simulated datasets
+2. Write pipeline to apply all steps for each
+3. Save ARI output from each iteration
+4. generate summary stats for ARI
+
+
+# NEED TO ADD: 5. save weights from cBMA (and other outputs? into list? probably helpful. list of lists...)
+
+#### Leave out LCA as lacking citation and literature on application to ensemble clustering --> added based on GitHub request, citation/justification missing for application in an ensemble context #### 
+
+
+
+
+1. Write pipeline to apply all steps for each
+- cluster algs
+- ensemble algs (mentioned in diceR paper)
+- clusterBMA
+- calculate and save ARI
+
+
+```{r}
+
+
+# COMPUTING CLUSTER ALGS
+
+
+sim_pipeline_10sim_nd_function <- function(sim_data_list){
+       
+columns = c("ARI_CSPA","ARI_LCE","ARI_k_modes","ARI_majority_voting","ARI_clusterBMA","ARI_clusterBMA_highcertainty","proportion_highcertainty")
+ARI_storage_df = data.frame(matrix(nrow = 1, ncol = length(columns))) 
+colnames(ARI_storage_df) = columns
+
+
+cBMA_results_store <- vector(mode="list")
+        
+for(i in 1:length(sim_data_list$datList)){
+        
+        simul_df <- sim_data_list$datList[[i]]
+        
+diceR_clusters <- diceR::consensus_cluster(data=simul_df,nk=3,p.item=1, algorithms = c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans"), reps = 1) #having issues with nmf and block bugs/performance- removing
+
+
+
+# COMPUTING ENSEMBLE - CSPA, LCE, k-modes, majority voting (all 4 mentioned in diceR paper with cites for ensemble clustering application -- leaving out LCA as ambiguous literature basis/seems to be implemented based on GitHub request...)
+
+
+CSPA_output <- CSPA(diceR_clusters,k=3)
+
+LCE_output <- LCE(as.matrix(diceR_clusters[,1,,1]), k=3, sim.mat="cts")
+
+
+k_modes_output <- k_modes(diceR_clusters, is.relabelled = F)
+
+majority_voting_output <- majority_voting(diceR_clusters, is.relabelled = F)
+
+
+
+
+
+
+#-------------------------------
+
+# RUNNING CLUSTERBMA
+
+
+
+cluster_labs_diceR <- as.matrix(diceR_clusters[,1,,1])
+
+hc_probs <- hard_to_prob_fn(cluster_labs_diceR[,1],n_clust=3)
+diana_probs <- hard_to_prob_fn(cluster_labs_diceR[,2],n_clust=3)
+km_probs <- hard_to_prob_fn(cluster_labs_diceR[,3],n_clust=3)
+pam_probs <- hard_to_prob_fn(cluster_labs_diceR[,4],n_clust=3)
+ap_probs <- hard_to_prob_fn(cluster_labs_diceR[,5],n_clust=3)
+sc_probs <- hard_to_prob_fn(cluster_labs_diceR[,6],n_clust=3)
+gmm_probs <- hard_to_prob_fn(cluster_labs_diceR[,7],n_clust=3)
+som_probs <- hard_to_prob_fn(cluster_labs_diceR[,8],n_clust=3)
+cmeans_probs <- hard_to_prob_fn(cluster_labs_diceR[,9],n_clust=3)
+
+
+list_of_probs <- list(hc_probs,diana_probs,km_probs,pam_probs,ap_probs,sc_probs,gmm_probs,som_probs,cmeans_probs)
+
+cBMA_output <- clusterBMA::clusterBMA(input_data = simul_df,cluster_prob_matrices = list_of_probs,n_final_clust = 3,wt_crit_name = "Calinski_Harabasz",wt_crit_direction = "max")
+cBMA_output
+#cBMA_output_sdbw <- clusterBMA::clusterBMA(input_data = simul_df,cluster_prob_matrices = list_of_probs,n_final_clust = 3,wt_crit_name = "S_Dbw",wt_crit_direction = "min")
+
+
+
+cBMA_output[[3]]
+cBMA_output[[5]]
+
+#cBMA_output_sdbw[[5]]
+#cBMA_output[[5]]
+
+
+
+
+
+#---------------------------
+
+# COMBINING OUTPUTS INTO ONE DF
+
+
+
+
+
+
+true_labs <- sim_data_list$memList[[i]]
+
+plotting_df <- data.frame(cbind(simul_df,CSPA_output,LCE_output,k_modes_output,majority_voting_output,cBMA_output[[3]]$alloc_ordered,cBMA_output[[3]]$alloc_prob,true_labs))
+# 
+# names(plotting_df)
+# length(plotting_df)
+# plotting_df[,4:8] <- lapply(plotting_df[,4:8],as.factor)
+
+names(plotting_df)[ncol(plotting_df)-2] <- "clusterBMA_output" 
+names(plotting_df)[ncol(plotting_df)-1] <- "clusterBMA_probs" 
+
+#view(plotting_df)
+
+
+
+#------------------------------
+
+
+# comparing accuracy using Adjusted RAnd Index
+
+
+names(plotting_df)
+
+
+# CSPA
+ARI_CSPA <- pdfCluster::adj.rand.index(plotting_df$CSPA_output,plotting_df$true_labs)
+
+# LCE
+ARI_LCE <- pdfCluster::adj.rand.index(plotting_df$LCE_output,plotting_df$true_labs)
+
+
+# k_modes
+ARI_k_modes <- pdfCluster::adj.rand.index(plotting_df$k_modes_output,plotting_df$true_labs)
+
+
+# majority_voting
+ARI_majority_voting <- pdfCluster::adj.rand.index(plotting_df$majority_voting_output,plotting_df$true_labs)
+
+
+# clusterBMA
+ARI_clusterBMA <- pdfCluster::adj.rand.index(plotting_df$clusterBMA_output,plotting_df$true_labs)
+
+
+highcertainty_threshold <- 0.8
+ARI_clusterBMA_highcertainty <- pdfCluster::adj.rand.index(plotting_df$clusterBMA_output[cBMA_output[[3]]$alloc_prob>highcertainty_threshold],plotting_df$true_labs[cBMA_output[[3]]$alloc_prob>highcertainty_threshold])
+
+ARI_CSPA
+ARI_LCE
+ARI_k_modes
+ARI_majority_voting
+ARI_clusterBMA
+ARI_clusterBMA_highcertainty
+
+
+# how many high-certainty (>90% alloc prob) allocations?
+
+proportion_pts_in_highcertainty <- sum(cBMA_output[[3]]$alloc_prob>highcertainty_threshold) #569/600
+
+
+ARI_vector <- c(ARI_CSPA,ARI_LCE,ARI_k_modes,ARI_majority_voting,ARI_clusterBMA,ARI_clusterBMA_highcertainty,proportion_pts_in_highcertainty)
+
+
+ARI_storage_df <- rbind(ARI_storage_df,ARI_vector)
+
+cBMA_results_store <- append(cBMA_results_store,cBMA_output)
+
+print(paste("Completed loop", i, "in simulation pipeline for", deparse(substitute(sim_data_list))))
+}
+
+
+# remove leading row of NA's
+ARI_storage_df <- ARI_storage_df[-1,]
+
+return(list(ARI_storage_df,cBMA_results_store))
+
+}
+
+
+
+```
+
+
+
+#2. Generate 3 lists of 10 x simulated datasets (x 3 levels of separation)... Running pipeline on 3 sep x 3 dim x 10 reps datasets
+
+#quick demo
+```{r}
+
+# 
+simdat_2d_quicktest <- clusterGeneration::genRandomClust(numClust=3,sepVal=0,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(50,3)),numReplicate = 10,clustszind = 3)
+# 
+# 
+# # test pipeline works with small dataset - 20 in each cluster, 2d
+# test_pipeline_out <- sim_pipeline_10sim_nd_function(simdat_2d_quicktest)
+#test_pipeline_out
+#psych::describe(test_pipeline_out)
+# seems good
+
+```
+
+
+
+
+
+
+
+
+
+# 3 clusters
+
+
+```{r}
+
+# Low separation -- sepVal = -0.15 compared to -.0.05
+
+
+
+#2D lowsep
+# 
+# simdat_2d_10reps_500each_lowsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.15,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_2d_10reps_500each_lowsep,file="sim_data_2d_10reps_500each_220123_lowsep")
+
+load("sim_data_2d_10reps_500each_220123_lowsep")
+
+
+
+#10D lowsep
+# 
+# simdat_10d_10reps_500each_lowsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.15,numNonNoisy=10,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_10d_10reps_500each_lowsep,file="sim_data_10d_10reps_500each_220123_lowsep")
+
+load("sim_data_10d_10reps_500each_220123_lowsep")
+
+
+#50D lowsep
+# 
+# simdat_50d_10reps_500each_lowsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.15,numNonNoisy=50,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_50d_10reps_500each_lowsep,file="sim_data_50d_10reps_500each_220123_lowsep")
+
+load("sim_data_50d_10reps_500each_220123_lowsep")
+
+
+
+#--------------
+
+
+results_2d_10reps_500each_lowsep <- sim_pipeline_10sim_nd_function(simdat_2d_10reps_500each_lowsep)
+
+results_10d_10reps_500each_lowsep <- sim_pipeline_10sim_nd_function(simdat_10d_10reps_500each_lowsep)
+
+results_50d_10reps_500each_lowsep <- sim_pipeline_10sim_nd_function(simdat_50d_10reps_500each_lowsep)
+
+
+
+
+# load("results_2d_10reps_500each_lowsep")
+# load("results_10d_10reps_500each_lowsep")
+# load("results_50d_10reps_500each_lowsep")
+# 
+
+ARI_table_2d_10reps_500each_lowsep <- results_2d_10reps_500each_lowsep[[1]]
+cBMA_results_2d_10reps_500each_lowsep <- results_2d_10reps_500each_lowsep[[2]]
+
+
+ARI_table_10d_10reps_500each_lowsep <- results_10d_10reps_500each_lowsep[[1]]
+cBMA_results_10d_10reps_500each_lowsep <- results_10d_10reps_500each_lowsep[[2]]
+
+
+ARI_table_50d_10reps_500each_lowsep <- results_50d_10reps_500each_lowsep[[1]]
+cBMA_results_50d_10reps_500each_lowsep <- results_50d_10reps_500each_lowsep[[2]]
+
+
+ARI_table_2d_10reps_500each_lowsep
+psych::describe(ARI_table_2d_10reps_500each_lowsep)
+
+ARI_table_10d_10reps_500each_lowsep
+psych::describe(ARI_table_10d_10reps_500each_lowsep)
+
+ARI_table_50d_10reps_500each_lowsep
+psych::describe(ARI_table_50d_10reps_500each_lowsep)
+# 
+# 
+
+
+# 
+# save(results_2d_10reps_500each_lowsep,file="results_2d_10reps_500each_lowsep")
+# save(results_10d_10reps_500each_lowsep,file="results_10d_10reps_500each_lowsep")
+# save(results_50d_10reps_500each_lowsep,file="results_50d_10reps_500each_lowsep")
+
+# 
+
+
+```
+
+```{r}
+
+#-------------
+
+
+
+# Medium separation sepVal = -0.05
+
+
+#Medium separation
+#2D
+# 
+# simdat_2d_10reps_500each_medsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.05,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_2d_10reps_500each_medsep,file="sim_data_2d_10reps_500each_medsep_200123")
+
+load("sim_data_2d_10reps_500each_medsep_200123")
+
+
+
+#10D
+# 
+# simdat_10d_10reps_500each_medsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.05,numNonNoisy=10,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_10d_10reps_500each_medsep,file="sim_data_10d_10reps_500each_medsep_200123")
+
+load("sim_data_10d_10reps_500each_medsep_200123")
+
+
+#50D
+
+# simdat_50d_10reps_500each_medsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.05,numNonNoisy=50,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_50d_10reps_500each_medsep,file="sim_data_50d_10reps_500each_medsep_200123")
+
+load("sim_data_50d_10reps_500each_medsep_200123")
+
+
+#-----
+
+
+
+results_2d_10reps_500each_medsep <- sim_pipeline_10sim_nd_function(simdat_2d_10reps_500each_medsep)
+
+results_10d_10reps_500each_medsep <- sim_pipeline_10sim_nd_function(simdat_10d_10reps_500each_medsep)
+
+results_50d_10reps_500each_medsep <- sim_pipeline_10sim_nd_function(simdat_50d_10reps_500each_medsep)
+
+
+ARI_table_2d_10reps_500each_medsep <- results_2d_10reps_500each_medsep[[1]]
+cBMA_results_2d_10reps_500each_medsep <- results_2d_10reps_500each_medsep[[2]]
+
+
+ARI_table_10d_10reps_500each_medsep <- results_10d_10reps_500each_medsep[[1]]
+cBMA_results_10d_10reps_500each_medsep <- results_10d_10reps_500each_medsep[[2]]
+
+
+ARI_table_50d_10reps_500each_medsep <- results_50d_10reps_500each_medsep[[1]]
+cBMA_results_50d_10reps_500each_medsep <- results_50d_10reps_500each_medsep[[2]]
+
+
+ARI_table_2d_10reps_500each_medsep
+psych::describe(ARI_table_2d_10reps_500each_medsep)
+
+ARI_table_10d_10reps_500each_medsep
+psych::describe(ARI_table_10d_10reps_500each_medsep)
+
+ARI_table_50d_10reps_500each_medsep
+psych::describe(ARI_table_50d_10reps_500each_medsep)
+# 
+# 
+
+# 
+# 
+# save(results_2d_10reps_500each_medsep,file="results_2d_10reps_500each_medsep")
+# save(results_10d_10reps_500each_medsep,file="results_10d_10reps_500each_medsep")
+# save(results_50d_10reps_500each_medsep,file="results_50d_10reps_500each_medsep")
+
+# 
+# load("results_2d_10reps_500each_medsep")
+# load("results_10d_10reps_500each_medsep")
+# load("results_50d_10reps_500each_medsep")
+
+  
+#-----------------------
+
+# HIGH SEPARATION sepVal = 0.1
+
+
+
+
+#2D highsep
+# 
+# simdat_2d_10reps_500each_highsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=0.1,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_2d_10reps_500each_highsep,file="sim_data_2d_10reps_500each_220123_highsep")
+
+load("sim_data_2d_10reps_500each_220123_highsep")
+
+
+
+#10D highsep
+
+# simdat_10d_10reps_500each_highsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=0.1,numNonNoisy=10,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_10d_10reps_500each_highsep,file="sim_data_10d_10reps_500each_220123_highsep")
+
+load("sim_data_10d_10reps_500each_220123_highsep")
+
+
+#50D highsep
+# 
+# simdat_50d_10reps_500each_highsep <- clusterGeneration::genRandomClust(numClust=3,sepVal=0.1,numNonNoisy=50,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 10,clustszind = 3)
+# 
+# save(simdat_50d_10reps_500each_highsep,file="sim_data_50d_10reps_500each_220123_highsep")
+
+load("sim_data_50d_10reps_500each_220123_highsep")
+
+
+
+#--------------
+
+
+
+results_2d_10reps_500each_highsep <- sim_pipeline_10sim_nd_function(simdat_2d_10reps_500each_highsep)
+
+results_10d_10reps_500each_highsep <- sim_pipeline_10sim_nd_function(simdat_10d_10reps_500each_highsep)
+
+results_50d_10reps_500each_highsep <- sim_pipeline_10sim_nd_function(simdat_50d_10reps_500each_highsep)
+
+
+ARI_table_2d_10reps_500each_highsep <- results_2d_10reps_500each_highsep[[1]]
+cBMA_results_2d_10reps_500each_highsep <- results_2d_10reps_500each_highsep[[2]]
+
+
+ARI_table_10d_10reps_500each_highsep <- results_10d_10reps_500each_highsep[[1]]
+cBMA_results_10d_10reps_500each_highsep <- results_10d_10reps_500each_highsep[[2]]
+
+
+ARI_table_50d_10reps_500each_highsep <- results_50d_10reps_500each_highsep[[1]]
+cBMA_results_50d_10reps_500each_highsep <- results_50d_10reps_500each_highsep[[2]]
+
+
+ARI_table_2d_10reps_500each_highsep
+psych::describe(ARI_table_2d_10reps_500each_highsep)
+
+ARI_table_10d_10reps_500each_highsep
+psych::describe(ARI_table_10d_10reps_500each_highsep)
+
+ARI_table_50d_10reps_500each_highsep
+psych::describe(ARI_table_50d_10reps_500each_highsep)
+# 
+# 
+
+# 
+# 
+# save(results_2d_10reps_500each_highsep,file="results_2d_10reps_500each_highsep")
+# save(results_10d_10reps_500each_highsep,file="results_10d_10reps_500each_highsep")
+# save(results_50d_10reps_500each_highsep,file="results_50d_10reps_500each_highsep")
+
+# 
+# load("results_2d_10reps_500each_highsep")
+# load("results_10d_10reps_500each_highsep")
+# load("results_50d_10reps_500each_highsep")
+
+```
+
+
+# Plot showing example data for 2D simulations
+```{r}
+
+eg_sim_far <- clusterGeneration::genRandomClust(numClust=3,sepVal=0.1,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 1,clustszind = 3)
+eg_sim_far_df <- eg_sim_far$datList$test_1
+
+eg_sim_med <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.05,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 1,clustszind = 3)
+eg_sim_med_df <- eg_sim_med$datList$test_1
+
+eg_sim_close <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.15,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(500,3)),numReplicate = 1,clustszind = 3)
+eg_sim_close_df <- eg_sim_close$datList$test_1
+
+
+far_eg_gg <- ggplot() + 
+  geom_point(aes(x=eg_sim_far_df[,1],y=eg_sim_far_df[,2]))+ 
+  xlab("")+ 
+  ylab("")+
+  guides(size = "none")+
+  ggtitle("a) 2D Simulated data - High Separation") + theme_bw()
+
+
+
+med_eg_gg <- ggplot() + 
+  geom_point(aes(x=eg_sim_med_df[,1],y=eg_sim_med_df[,2]))+ 
+  xlab("")+ 
+  ylab("")+
+  guides(size = "none")+
+  ggtitle("b) 2D Simulated data - Medium Separation") + theme_bw()
+
+
+close_eg_gg <- ggplot() + 
+  geom_point(aes(x=eg_sim_close_df[,1],y=eg_sim_close_df[,2]))+ 
+  xlab("")+ 
+  ylab("")+
+  guides(size = "none")+
+  ggtitle("c) 2D Simulated data - Low Separation") + theme_bw()
+
+
+
+png(file='sim_2d_eg_plots.png',width=1500,height=500,pointsize=22)
+grid.arrange(far_eg_gg,med_eg_gg,close_eg_gg,nrow=1, ncol=3)
+dev.off()
+
+
+tiff("sim_2d_eg_plots.tif", compression = "lzw",width = 1500, height = 500, pointsize = 22)
+grid.arrange(far_eg_gg,med_eg_gg,close_eg_gg,nrow=1, ncol=3)
+dev.off()  
+
+```
+
+
+
+# Generate supplementary table for cBMA weights mean(sd) for sim study benchmark
+
+```{r}
+
+# HIGH SEPARATION
+
+load("results_2d_10reps_500each_highsep")
+load("results_10d_10reps_500each_highsep")
+load("results_50d_10reps_500each_highsep")
+
+#---
+
+library(gtsummary)
+weights_2d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_2d <- rbind(weights_2d,results_2d_10reps_500each_highsep[[2]][[i]])
+}
+
+names(weights_2d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+#---
+
+
+weights_10d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_10d <- rbind(weights_10d,results_10d_10reps_500each_highsep[[2]][[i]])
+}
+
+names(weights_10d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+
+#---
+
+
+weights_50d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_50d <- rbind(weights_50d,results_50d_10reps_500each_highsep[[2]][[i]])
+}
+
+names(weights_50d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+
+#-----------
+
+# Formatted tables
+
+weights_2d_gt <- weights_2d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "2D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+
+weights_10d_gt <- weights_10d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "10D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+
+weights_50d_gt <- weights_50d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "50D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+# Combine them
+combined_weights_tbl <- tbl_merge(list(weights_2d_gt,weights_10d_gt,weights_50d_gt),tab_spanner = F)
+
+
+combined_weights_tbl %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html()
+```
+
+
+```{r}
+# MEDIUM SEPARATION
+
+
+load("results_2d_10reps_500each_medsep")
+load("results_10d_10reps_500each_medsep")
+load("results_50d_10reps_500each_medsep")
+
+#---
+
+library(gtsummary)
+weights_2d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_2d <- rbind(weights_2d,results_2d_10reps_500each_medsep[[2]][[i]])
+}
+
+names(weights_2d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+#---
+
+
+weights_10d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_10d <- rbind(weights_10d,results_10d_10reps_500each_medsep[[2]][[i]])
+}
+
+names(weights_10d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+
+#---
+
+
+weights_50d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_50d <- rbind(weights_50d,results_50d_10reps_500each_medsep[[2]][[i]])
+}
+
+names(weights_50d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+
+#-----------
+
+# Formatted tables
+
+weights_2d_gt <- weights_2d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "2D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+
+weights_10d_gt <- weights_10d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "10D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+
+weights_50d_gt <- weights_50d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "50D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+# Combine them
+combined_weights_tbl <- tbl_merge(list(weights_2d_gt,weights_10d_gt,weights_50d_gt),tab_spanner = F)
+
+
+combined_weights_tbl %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html()
+```
+
+```{r}
+# LOW SEPARATION
+
+
+load("results_2d_10reps_500each_lowsep")
+load("results_10d_10reps_500each_lowsep")
+load("results_50d_10reps_500each_lowsep")
+
+#---
+
+library(gtsummary)
+weights_2d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_2d <- rbind(weights_2d,results_2d_10reps_500each_lowsep[[2]][[i]])
+}
+
+names(weights_2d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+#---
+
+
+weights_10d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_10d <- rbind(weights_10d,results_10d_10reps_500each_lowsep[[2]][[i]])
+}
+
+names(weights_10d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+
+#---
+
+
+weights_50d <- data.frame(matrix(ncol=9,nrow=0))
+
+for(i in c(5,12,19,26,33,40,47,54,61,68)){
+weights_50d <- rbind(weights_50d,results_50d_10reps_500each_lowsep[[2]][[i]])
+}
+
+names(weights_50d) <- c("hc", "diana", "km", "pam", "ap", "sc",
+"gmm", "som", "cmeans")
+
+
+#-----------
+
+# Formatted tables
+
+weights_2d_gt <- weights_2d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "2D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+
+weights_10d_gt <- weights_10d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "10D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+
+weights_50d_gt <- weights_50d   %>% 
+    tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = everything() ~ 3,
+      missing="no"
+    ) %>% 
+     modify_header(label = "50D Simulated Data")
+  # gtsummary::as_gt() %>%
+  # gt::as_latex()
+
+
+# Combine them
+combined_weights_tbl <- tbl_merge(list(weights_2d_gt,weights_10d_gt,weights_50d_gt),tab_spanner = F)
+
+
+combined_weights_tbl %>% 
+  gtsummary::as_gt() %>%
+  gt::as_raw_html()
+```
+
+
+
+
+
+
+
+

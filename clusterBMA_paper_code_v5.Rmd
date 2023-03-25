@@ -1,0 +1,1114 @@
+---
+title: "clusterBMA paper code"
+author: "Owen Forbes"
+date: "28/06/2021"
+output: html_document
+---
+
+
+```{r setup, echo=T}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/Dropbox/QUT_MPhil/1-ThesisMaster/3-Tranche1-EEG/3-DataAnalysis/QUT_MPhil/Paper2_BMA_clustering/Code")
+
+# Packages
+library(clusterBMA)
+clusterBMA::clusterBMA_use_condaenv()
+library(rmatio) # 0.14.0 - for importing .mat tensor/array of matrices (spectrogram output of multitaper analysis)
+library(ForeCA) # for spectral entropy - to be run on cleaned EEG time series per channel
+library(psych) # For PCA
+library(stringr) # for string splitting 
+library(tidyverse) # for magrittr piping, ggplot, etc
+library(factoextra) # for fviz_*
+library(plotly) #for 3d plots
+library(mclust)
+library(dbscan)
+library(xtable) #for LaTeX tables
+library(gridExtra) #for arranging ggplots
+library(viridis) #for Viridis palette
+library(emmeans) #for pairwise contrasts from categorical brms
+library(brms) #for Bayesian regression models
+library(rv) #for comparing posterior probability for differences in outcomes between clusters (saving Stan draws as "random variable" objects)
+library(tensorflow) 
+# see reticulate virtual environment setup at start of chunk 2 for using python 3.7.9 and tensorflow 1.13.1
+library(latex2exp)
+
+set.seed(122) #for kmeans and kmedoids i think??
+```
+
+
+
+
+# Leo Duan - symmetric simplex matrix factorisation for NxN similarity --> NxK cluster allocations
+
+```{r}
+
+#https://stackoverflow.com/questions/53429896/how-do-i-disable-tensorflows-eager-execution
+#https://stackoverflow.com/questions/57858219/loss-passed-to-optimizer-compute-gradients-should-be-a-function-when-eager-exe
+
+
+# RUN UN-COMMENTED LINES BELOW TO SETUP COMPATIBLE PYTHON AND TENSORFLOW VERSIONS IN A VIRTUAL ENVIRONMENT
+# You need to have downloaded Python v. 3.7.9 and have it saved in an accessible filepath
+
+# reticulate::virtualenv_create(envname="py_virtual_jan21",python="/Users/Current/.pyenv/versions/3.7.9/bin/python3.7")
+# 
+# tensorflow::install_tensorflow(method="virtualenv",version = "1.15.5",envname = "py_virtual_jan21",python_version = "3.7.9")
+
+reticulate::use_virtualenv("py_virtual_jan21")
+
+require("tensorflow")
+  
+#tf$compat.v1.disable_v2_behavior
+# 
+#tf$compat$v1$disable_eager_execution()
+
+
+# Test result: Disabling L2 Regularization makes minimal/no difference to resulting allocations/uncertainty (at least with case study when all clusters occupied/non-redundant)
+# L2 Regularization useful in the instance where there are likely to be redundant/empty clusters out of the total maximum specified, so leaving it enabled
+
+#input:
+# S: an n x n similarity matrix
+# G: number of clusters
+# lambda: the amount of L2 regularization (can be set to 0)
+# steps: number of iterations (more = marginally better convergence. Mostly seems to converge after ~2000 steps (original default))
+
+SimplexClust<- function(S, G, lambda = 1, eps= 1E-2,steps=5000, choice_loss = "KL"){
+  
+  reticulate::use_virtualenv("py_virtual_jan21")
+
+require("tensorflow")
+  
+#tf$compat.v1.disable_v2_behavior
+# 
+#tf$compat$v1$disable_eager_execution()
+
+
+  
+  N<- nrow(S)
+  # create a simplex matrix
+  P0 <-  tf$math$softplus(tf$Variable(tf$random_uniform(shape(N,G), 0, 1)))
+  P0sum<- tf$reduce_sum(P0,  axis=as.integer(1), keepdims=TRUE)
+  
+  # zero out the diagonal matrix in the A matrix
+  ZeroDiagInd<- matrix(1,N,N)
+  diag(ZeroDiagInd)<- 0
+  ZeroDiagIndTF <- tf$cast(ZeroDiagInd, tf$float32)
+  P = P0 / P0sum
+  A = tf$matmul(P, P,transpose_b = T)
+  
+  S_tf = tf$cast(S,tf$float32)
+  logS_tf = tf$log(S_tf)
+  
+  if(choice_loss == "KL"){
+    # #KL loss: S||A
+    logRatio= - tf$log(A)
+    logRatioComp=  - tf$log(1.0-A)
+    loss_mat = tf$multiply( S_tf , logRatio ) + tf$multiply( 1.0- S_tf, logRatioComp)
+  }
+  
+  if(choice_loss == "L2"){
+    ## L2 loss
+    loss_mat = tf$multiply(S_tf - A,S_tf - A)
+  }
+  
+  loss = tf$reduce_sum(loss_mat * ZeroDiagIndTF)
+  
+  L21_norm = tf$reduce_sum(tf$sqrt(tf$reduce_sum(P*P, as.integer(0))))
+  
+  rank_prior_loss =  L21_norm
+  
+  #relax_loss =  1E3 * tf$reduce_sum(tf$multiply(P0sum-1,P0sum-1))
+  
+  total_loss = loss +  lambda * rank_prior_loss  #+ relax_loss
+  
+  optimizer <- tf$train$AdamOptimizer(eps)
+  
+  train <- optimizer$minimize(total_loss)
+  
+  # Launch the graph and initialize the variables.
+  sess = tf$Session()
+  sess$run(tf$global_variables_initializer())
+  
+  for (step in 1:steps) {
+    sess$run(train)
+    if (step %% 20 == 0)
+      cat(step, "-", sess$run(loss),"\n")
+  }
+  
+  est_P<- sess$run(P)
+  est_A<- sess$run(A)
+  
+  return(list("P"=est_P, "A"=est_A))
+}
+
+
+
+# test
+#test_eeg_new <- SimplexClust(S=eeg_consensus_matrix,G=5)
+
+```
+
+
+# Testing Leo's matrix factorisation approach using eeg_consensus_matrix as input (need to run chunks below to generate this matrix)
+
+
+```{r}
+
+# leo_test_eeg <- SimplexClust(S=eeg_consensus_matrix,G=5)
+# leo_test_eeg
+# 
+# save(leo_test_eeg,file="leo_test_eeg_matrixfactorised")
+
+#load("leo_test_eeg_matrixfactorised")
+```
+
+
+# Function to get 'hard' allocations and probability/uncertainty from soft allocation probability matrix ($P output from SimplexClust())
+
+```{r}
+
+# Function to get 'hard' allocations and probability/uncertainty from soft allocation probability matrix ($P output from SimplexClust())
+
+prob_to_hard_fn <- function(soft_alloc_matrix){
+  alloc_vector <- vector(mode="numeric",length=length(soft_alloc_matrix[,1]))
+  
+  alloc_vector <- apply(soft_alloc_matrix,1,which.max)
+  
+  alloc_out <- data.frame(alloc_vector)
+  
+  alloc_out$alloc_prob <- apply(soft_alloc_matrix,1,max)
+  
+  alloc_out$alloc_uncertainty <- 1 - apply(soft_alloc_matrix,1,max)
+  
+  cluster_table <-  sort(table(alloc_vector),decreasing=T)
+  
+  # DO A FOR LOOP HERE
+  
+  alloc_out$alloc_ordered <- rep(NA,length(alloc_out[,1]))
+  
+  for (i in 1:length(alloc_out[,1])){
+    alloc_out$alloc_ordered[i] <- which(alloc_vector[i] == as.numeric(names(cluster_table)))
+  }
+  
+  cluster_table_ordered <-  sort(table(alloc_out$alloc_ordered),decreasing=T)
+    
+  return(list(alloc_out,cluster_table_ordered))
+}
+
+
+
+# Test
+
+#eeg_test_soft <- leo_test_eeg$P
+
+#prob_to_hard_fn(eeg_test_soft)[1]
+#prob_to_hard_fn(eeg_test_soft)[2]
+
+```
+
+
+
+
+
+# BMA FUNCTIONS
+- cast hard allocation as allocation probs (0,1)
+- Turn probs (hard [km, hc] or soft [gmm]) into similarity matrix
+- calculate XB and CH for hard allocation
+- calculate weights (my new piece)
+- weighted average them together
+
+```{r similarity matrices}
+
+
+# Kmeans/hclust (hard clusters) to probability matrix
+# Takes a vector of cluster assignments and turns into matrix of 1s and 0s for cluster allocation
+
+
+hard_to_prob_fn <- function(hard_clusters,n_clust){
+prob_mat <- matrix(0,nrow=length(hard_clusters),ncol=n_clust)
+for(i in 1:length(hard_clusters)){
+  prob_mat[i,hard_clusters[i]] <- 1
+}
+prob_mat
+}
+
+#-------------------------------------
+
+# SIMILARITY MATRIX
+
+#cluster_probs should be a probability matrix of cluster membership
+
+sim_mat_fn <- function(cluster_probs){
+  
+  # starting as a for loop - can try vectorising later if it's too slow
+  
+ # sim_mat_out <- matrix(NA,nrow=nrow(cluster_probs),ncol=nrow(cluster_probs))
+  
+  sim_mat_out <- cluster_probs %*% t(cluster_probs)
+  
+  diag(sim_mat_out) <- 1
+  
+
+  sim_mat_out
+}
+
+
+```
+
+
+# Consensus matrix + consensus dendrogram
+```{r consensus matrix}
+
+
+# CH & XB WEIGHTS
+
+
+# Returns c(Xie-Beni,Calinski-Harabasz)
+# Expects cluster_labels to be data frame with columns of cluster labels from different algorithms (hard projection from soft algos), and n_sols to be the number of solutions input
+ch_xb_weight_fn <- function(input_data,cluster_label_df,n_sols){
+  
+  out_df <- data.frame(XB = NA, CH = NA, XB_w = NA, CH_w = NA, W_each = NA, W_m = NA)
+  
+  #050721 trying quick fix here braindead 3am
+  input_data <- as.matrix(input_data)
+  
+  for (i in 1:n_sols){
+  xb_temp <- clusterCrit::intCriteria(traj=input_data,part=as.integer(cluster_label_df[,i]),crit=c("Xie_Beni")) 
+  ch_temp <- clusterCrit::intCriteria(traj=input_data,part=as.integer(cluster_label_df[,i]),crit=c("Calinski_Harabasz"))
+  
+  row_temp <- c(xb_temp$xie_beni,ch_temp$calinski_harabasz,NA,NA,NA,NA)
+  out_df <- rbind(out_df,row_temp)
+  }
+  
+  #remove NA row
+  out_df <- out_df[-1,]
+  
+  for (i in 1:n_sols){
+    out_df[i,"XB_w"] <- out_df$XB[i]/sum(out_df$XB)
+    out_df[i,"CH_w"] <- (1/out_df$CH[i])/sum(1/out_df$CH)
+  }
+  
+  out_df$W_each <- out_df$XB_w + out_df$CH_w
+  
+  for (i in 1:n_sols){
+    out_df[i,"W_m"] <- out_df$W_each[i]/sum(out_df$W_each)
+  }
+  
+  return(out_df)
+}
+
+
+#eeg_bma_weights_df <- ch_xb_weight_fn(input_data=eeg_pc_data,cluster_label_df = eeg_cluster_labels_df,n_sols = 3)
+
+
+
+
+```
+
+# Consensus matrix
+```{r}
+#----------------
+
+consensus_matrix_fn <- function(sim_mat_list,algo_weights,n_final_clust){
+  
+  # stack similarity matrices into array
+  
+n <- length(sim_mat_list); 	   rc <- dim(sim_mat_list[[1]]); 	   ar1 <- array(unlist(sim_mat_list), c(rc, n))
+
+
+# 060721
+
+# Old version works fine - updated to use Hmisc:: wtd.mean so I can also calculated Hmisc:: wtd.var for weighted variance and SD across methods
+# consensus_matrix <- Reduce(`+`,Map(`*`, sim_mat_list, algo_weights))
+
+# See this discussion on weighted variance https://r.789695.n4.nabble.com/Problem-with-Weighted-Variance-in-Hmisc-td826437.html
+# essential to use normwt=T for Hmisc::wtd.var below
+
+consensus_matrix <- apply(ar1, c(1, 2), function(x) Hmisc::wtd.mean(x,weights=algo_weights))
+
+consensus_matrix
+
+consensus_fn_heatmap <- pheatmap::pheatmap(consensus_matrix, treeheight_row = 0, treeheight_col = 0, main = "d) BMA - Consensus matrix")
+consensus_fn_heatmap
+
+consensus_SSMF <- SimplexClust(S=consensus_matrix,G=n_final_clust)
+
+bma_probs <- consensus_SSMF[[1]]
+
+bma_prob_to_hard <- prob_to_hard_fn(bma_probs)
+
+bma_labels_df <- bma_prob_to_hard[[1]]
+  
+bma_table <- bma_prob_to_hard[[2]]
+  
+  
+return(list(consensus_matrix,bma_probs,bma_labels_df,bma_table,consensus_fn_heatmap))
+#print(consensus_dendro)
+}
+
+
+
+
+
+
+# eeg_bma_results <- consensus_matrix_fn(sim_mat_list = eeg_sim_mats_list,algo_weights=eeg_bma_weights_df$W_m,n_final_clust=5)
+
+```
+
+
+
+
+
+--------
+
+# CASE STUDY
+
+- import clusters from applied paper on EEG clustering
+
+```{r}
+# imports df called "cluster_df_save_290621" with outputs for case study
+load("eeg_cluster_df_290621")
+
+#import probability matrix called "gmm_soft_ordered" of soft cluster allocations from GMM
+load("gmm_soft_050721")
+
+
+# Pull out clustering input data for calculating IV indices
+
+eeg_pc_data <- as.matrix(data.frame(cluster_df_save_290621$pc1,cluster_df_save_290621$pc2,cluster_df_save_290621$pc3))
+
+eeg_cluster_labels_df <- data.frame(cluster_df_save_290621$km_cluster,cluster_df_save_290621$hc_cluster,cluster_df_save_290621$gmm_cluster_hard)
+
+```
+
+
+# Plot showing overlap for case study(save as html)
+```{r}
+#plot_3d_core
+
+```
+
+
+# Compute cluster probabilities and similarity matrices, plot heatmaps
+
+```{r}
+
+
+#case study - hard clusters to CLUSTER PROBABILITY MATRICES
+eeg_km_prob <- hard_to_prob_fn(cluster_df_save_290621$km_cluster,5)
+eeg_hc_prob <- hard_to_prob_fn(cluster_df_save_290621$hc_cluster,5)
+
+# imported gmm probs
+eeg_gmm_prob <- gmm_soft_ordered
+
+
+# Compute SIMILARITY MATRICES
+
+eeg_km_similarity <- sim_mat_fn(eeg_km_prob)
+eeg_hc_similarity <- sim_mat_fn(eeg_hc_prob)
+eeg_gmm_similarity <- sim_mat_fn(eeg_gmm_prob)
+
+eeg_sim_mats_list <- list(eeg_km_similarity,eeg_hc_similarity,eeg_gmm_similarity)
+
+# HEAT MAPS
+
+km_heatmap <- pheatmap::pheatmap(eeg_km_similarity, treeheight_row = 0, treeheight_col = 0,main="a) k-means - Weight = 0.35")
+km_heatmap
+hc_heatmap <- pheatmap::pheatmap(eeg_hc_similarity, treeheight_row = 0, treeheight_col = 0,main="b) Hierarchical Clustering - Weight = 0.30")
+hc_heatmap
+gmm_heatmap <- pheatmap::pheatmap(eeg_gmm_similarity, treeheight_row = 0, treeheight_col = 0,main="c) Gaussian Mixture Model - Weight = 0.35")
+gmm_heatmap
+
+
+#-------
+
+# calculate WEIGHTS
+# eeg_bma_weights_df <- ch_xb_weight_fn(input_data=eeg_pc_data,cluster_label_df = eeg_cluster_labels_df,n_sols = 3)
+# 
+# 
+# eeg_bma_results <- consensus_matrix_fn(sim_mat_list = eeg_sim_mats_list,algo_weights=eeg_bma_weights_df$W_m,n_final_clust=5)
+
+
+############ 170123 - running with updated algorithm that uses JUST XB by default for weights
+eeg_probs_list <- list(eeg_km_prob,eeg_hc_prob,eeg_gmm_prob)
+
+##########
+eeg_bma_results <- clusterBMA::clusterBMA(input_data = eeg_pc_data,cluster_prob_matrices = eeg_probs_list,n_final_clust = 5,wt_crit_name = "Calinski_Harabasz",wt_crit_direction = "max")
+
+
+eeg_consensus_matrix <- eeg_bma_results[[1]] # consensus matrix
+eeg_bma_allocation_probs <- eeg_bma_results[[2]] # probs of cluster allocation after BMA
+eeg_bma_cluster_labels_df <- eeg_bma_results[[3]] # cluster allocations with probability and uncertainty
+eeg_bma_table <- eeg_bma_results[[4]] # table - how many in each cluster?
+eeg_bma_weights <- eeg_bma_results[[5]] # weights for each algo
+eeg_bma_weights_times_priors <- eeg_bma_results[[6]] # weights multiplied by prior probabilities - should be the same as output [5] if prior model weights are set to be equal (default)
+
+
+
+
+
+
+# hard allocations from BMA cutree with 5 clusters
+cluster_df_save_290621$bma_cluster_labs <- eeg_bma_cluster_labels_df$alloc_ordered
+
+
+#cluster_df_save_290621$bma_cluster_probs <- 
+
+cluster_df_save_290621$bma_cluster_uncertainty <- eeg_bma_cluster_labels_df$alloc_uncertainty
+
+
+
+
+
+# heatmap plot for consensus matrix
+consensus_heatmap <- pheatmap::pheatmap(eeg_consensus_matrix, treeheight_row = 0, treeheight_col = 0,main="d) BMA - Consensus matrix")
+consensus_heatmap
+
+png("heatmaps_EEG_090223.png",width=1000,height=1000,pointsize=22)
+grid.arrange(km_heatmap[[4]],hc_heatmap[[4]],gmm_heatmap[[4]],consensus_heatmap[[4]],nrow=2, ncol=2)
+dev.off()
+
+#return(list(consensus_matrix,consensus_labels,consensus_sds_wtd,consensus_dendro))
+
+
+```
+
+
+
+```{r 3d plot eeg}
+
+# Test 3D Plot consensus labeled data
+
+
+eeg_3d_BMA_size_uncertainty <- plot_ly(data=cluster_df_save_290621,x=cluster_df_save_290621$pc1,y=cluster_df_save_290621$pc2,z=cluster_df_save_290621$pc3,type="scatter3d",color=factor(cluster_df_save_290621$bma_cluster_labs),colors = viridis::viridis(n = 5), size=cluster_df_save_290621$bma_cluster_uncertainty,marker=list(sizeref=0.1, sizemode="area"))
+
+eeg_3d_BMA_size_uncertainty <- eeg_3d_BMA_size_uncertainty %>% layout(
+  #title="BMA clusters: size ~ mean probability of cluster allocation",
+        scene = list(
+      xaxis = list(title = "PC(or factor)1"),#,range = c(-2.5,2.5)),
+      yaxis = list(title = "PC(or factor)2"),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "PC(or factor)3")#,range = c(-2.5,2.5))
+    ))
+
+eeg_3d_BMA_size_uncertainty
+
+htmlwidgets::saveWidget(eeg_3d_BMA_size_uncertainty,file="eeg_3d_BMA_size_uncertainty_301122.html")
+
+
+```
+
+# 2D plots EEG Case Study
+
+```{r}
+
+
+plot_2d_1v2_bma <- ggplot(data=cluster_df_save_290621,aes(x=cluster_df_save_290621$pc1,y=cluster_df_save_290621$pc2)) + geom_point(aes(color=as.factor(cluster_df_save_290621$bma_cluster_labs),size=cluster_df_save_290621$bma_cluster_uncertainty)) + 
+  scale_colour_manual(values=RColorBrewer::brewer.pal(5,"Dark2"))+
+  labs(color = "Cluster", title="BMA Clusters") + 
+  xlab("PC1")+ 
+  ylab("PC2")+
+  guides(size = "none")
+
+# scale_size_manual(size = guide_legend(override.aes = list(name = "Allocation /n Uncertainty",
+#                                                  values = c(0.5, 0.6, 0.7, 0.8, 0.9),
+#                                                  breaks = c("0.5","0.4","0.3","0.2","0.1"))))
+
+
+plot_2d_1v2_bma
+
+plot_2d_1v3_bma <- ggplot(data=cluster_df_save_290621,aes(x=cluster_df_save_290621$pc1,y=cluster_df_save_290621$pc3)) + geom_point(aes(color=as.factor(cluster_df_save_290621$bma_cluster_labs),size=cluster_df_save_290621$bma_cluster_uncertainty)) + 
+  scale_colour_manual(values=RColorBrewer::brewer.pal(5,"Dark2"))+
+  labs(color = "Cluster", title="BMA Clusters") + 
+  xlab("PC1")+ 
+  ylab("PC3")+
+  guides(size="none")
+
+plot_2d_1v3_bma
+
+plot_2d_2v3_bma <- ggplot(data=cluster_df_save_290621,aes(x=cluster_df_save_290621$pc2,y=cluster_df_save_290621$pc3)) + geom_point(aes(color=as.factor(cluster_df_save_290621$bma_cluster_labs),size=cluster_df_save_290621$bma_cluster_uncertainty)) + 
+  scale_colour_manual(values=RColorBrewer::brewer.pal(5,"Dark2"))+
+  labs(color = "Cluster", title="BMA Clusters") + 
+  xlab("PC2")+ 
+  ylab("PC3")+
+  guides(size="none")
+
+plot_2d_2v3_bma
+
+
+# Core clusters 2d 3x1 160321
+png("2dplots_BMA_EEG_090223.png",width=1200,height=400,pointsize=22)
+grid.arrange(plot_2d_1v2_bma,plot_2d_1v3_bma,plot_2d_2v3_bma,nrow=1, ncol=3)
+dev.off()
+```
+
+
+------------
+
+
+
+
+------
+
+# SIMULATION STUDY 2
+
+```{r}
+library(clusterGeneration)
+```
+
+Demo cluster generation
+```{r}
+
+ NC <- 5
+# 
+# simul_data_far <- fungible::monte(seed=122,nvar=2,nclus=5,clus.size=c(100,100,100,100,100),eta2=c(0.999,0.999))
+# 
+# simul_far_df <- simul_data_far$data[,2:3]
+# plot(simul_far_df)
+# 
+# 
+# simul_data_mid <- fungible::monte(seed=122,nvar=2,nclus=5,clus.size=c(100,100,100,100,100),eta2=c(0.97,0.97))
+# 
+# simul_mid_df <- simul_data_mid$data[,2:3]
+# plot(simul_mid_df)
+# 
+# 
+# simul_data_close <- fungible::monte(seed=122,nvar=2,nclus=5,clus.size=c(100,100,100,100,100),eta2=c(0.8,0.8))
+# 
+# simul_close_df <- simul_data_close$data[,2:3]
+# plot(simul_close_df)
+
+# 
+# set.seed(122)
+# 
+# 
+# 
+# simul_data_far <- clusterGeneration::genRandomClust(numClust=NC,sepVal=0.6,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(100,NC)),numReplicate = 1,clustszind = 3)
+# simul_far_df <- simul_data_far$datList$test_1
+# plot(simul_far_df <- simul_data_far$datList$test_1)
+# 
+# 
+# 
+# simul_data_mid <- clusterGeneration::genRandomClust(numClust=NC,sepVal=0.15,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(100,NC)),numReplicate = 1,clustszind = 3)
+# 
+# simul_mid_df <- simul_data_mid$datList$test_1
+# plot(simul_mid_df <- simul_data_mid$datList$test_1)
+# 
+# 
+# simul_data_close <- clusterGeneration::genRandomClust(numClust=NC,sepVal=0,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(100,NC)),numReplicate = 1,clustszind = 3)
+# 
+# simul_close_df <- simul_data_close$datList$test_1
+# plot(simul_close_df <- simul_data_close$datList$test_1)
+
+
+# save/load data for paper
+
+# sim_data_k5_110222 <- list(simul_far_df,simul_mid_df,simul_close_df)
+# save(sim_data_k5_110222,file="sim_data_k5_110222")
+# 
+# sim_data_k5_080722 <- list(simul_far_df,simul_mid_df,simul_close_df)
+# save(sim_data_k5_080722,file="sim_data_k5_080722")
+
+# #
+# load("sim_data_k5_110222") #OLD
+
+load("sim_data_k5_080722")
+
+simul_far_df <- sim_data_k5_080722[[1]]
+simul_mid_df <- sim_data_k5_080722[[2]]
+simul_close_df <- sim_data_k5_080722[[3]]
+
+
+#----------
+
+# SCATTERPLOTS
+
+far_scatter_gg <- ggplot() + 
+  geom_point(aes(x=simul_far_df[,1],y=simul_far_df[,2]))+ 
+  xlab("")+ 
+  ylab("")+
+  guides(size = "none")+
+  ggtitle("a) Simulated data - High Separation") + theme_bw()
+
+
+
+mid_scatter_gg <- ggplot() + 
+  geom_point(aes(x=simul_mid_df[,1],y=simul_mid_df[,2]))+ 
+  xlab("")+ 
+  ylab("")+
+  guides(size = "none")+
+  ggtitle("b) Simulated data - Medium Separation") + theme_bw()
+
+
+close_scatter_gg <- ggplot() + 
+  geom_point(aes(x=simul_close_df[,1],y=simul_close_df[,2]))+ 
+  xlab("")+ 
+  ylab("")+
+  guides(size = "none")+
+  ggtitle("c) Simulated data - Low Separation") + theme_bw()
+
+
+
+png(file='sim_data_plots.png',width=1500,height=500,pointsize=22)
+grid.arrange(far_scatter_gg,mid_scatter_gg,close_scatter_gg,nrow=1, ncol=3)
+dev.off()
+
+
+tiff("sim_data_plots.tif", compression = "lzw",width = 1500, height = 500, pointsize = 22)
+grid.arrange(far_scatter_gg,mid_scatter_gg,close_scatter_gg,nrow=1, ncol=3)
+dev.off()  
+
+# png(file='sim_data_plots.png',width=1500,height=500,pointsize=22)
+# par(mfrow= c(1, 3))
+# plot(simul_far_df,main="a) Simulated data - High Separation")
+# plot(simul_mid_df,main="b) Simulated data - Medium Separation")
+# plot(simul_close_df,main="c) Simulated data - Low Separation")
+# dev.off()
+
+# plot(simul_far_df,main="Simulated data - High Separation")
+# plot(simul_mid_df,main="Simulated data - Medium Separation")
+# plot(simul_close_df,main="Simulated data - Low Separation")
+
+
+
+# 
+# 
+# plot(fungible::monte(seed=122,nvar=2,nclus=5,clus.size=c(100,100,100,100,100),eta2=c(0.999,0.999)))
+# 
+# plot(fungible::monte(seed=122,nvar=2,nclus=5,clus.size=c(100,100,100,100,100),eta2=c(0.97,0.97)))
+# 
+# plot(fungible::monte(seed=122,nvar=2,nclus=5,clus.size=c(100,100,100,100,100),eta2=c(0.8,0.8)))
+
+
+```
+
+```{r simulated pipeline}
+
+#simul_data = simulated dataset
+#NC = number of clusters
+#separation_level = string e.g. "High separation"
+simul_pipeline <- function(simul_data,NC,separation_level){
+  
+  set.seed(1234)
+  
+  simul_data <- as.data.frame(simul_data)
+  
+  km_simul <- kmeans(simul_data,centers=NC)
+  km_simul_labs <- km_simul$cluster
+  
+  hc_simul <- hclust(dist(simul_data),method="ward.D2")
+  hc_simul_labs <- cutree(hc_simul,k=NC)
+  
+  gmm_simul <- ClusterR::GMM(simul_data,gaussian_comps=NC,dist_mode="eucl_dist")
+
+  gmm_simul_predict <- ClusterR::predict_GMM(simul_data,CENTROIDS=gmm_simul$centroids,COVARIANCE = gmm_simul$covariance_matrices,WEIGHTS=gmm_simul$weights)
+  gmm_simul_labs <- gmm_simul_predict$cluster_labels
+  
+  simul_cluster_labels_df <- data.frame(km_simul_labs,hc_simul_labs,gmm_simul_labs)
+  
+#case study - hard clusters to CLUSTER PROBABILITY MATRICES
+simul_km_prob <- hard_to_prob_fn(km_simul_labs,NC)
+simul_hc_prob <- hard_to_prob_fn(hc_simul_labs,NC)
+
+# imported gmm probs
+simul_gmm_prob <- gmm_simul_predict$cluster_proba
+
+
+# Compute SIMILARITY MATRICES
+
+simul_km_similarity <- sim_mat_fn(simul_km_prob)
+simul_hc_similarity <- sim_mat_fn(simul_hc_prob)
+simul_gmm_similarity <- sim_mat_fn(simul_gmm_prob)
+
+simul_sim_mats_list <- list(simul_km_similarity,simul_hc_similarity,simul_gmm_similarity)
+
+
+
+
+
+#-------
+
+# calculate bma weights (CH, XB, etc) for each
+simul_bma_weights_df <- ch_xb_weight_fn(input_data=simul_data,cluster_label_df = simul_cluster_labels_df,n_sols = 3)
+
+
+
+
+# simul_bma_results <- consensus_matrix_fn(sim_mat_list = simul_sim_mats_list,algo_weights=simul_bma_weights_df$W_m,n_final_clust=NC)
+
+simul_bma_results <- clusterBMA(input_data = simul_data,cluster_prob_matrices = list(simul_km_prob,simul_hc_prob,simul_gmm_prob))
+
+
+simul_consensus_matrix <- simul_bma_results[[1]]
+simul_bma_cluster_labels_df <- simul_bma_results[[3]]
+simul_consensus_table <- simul_bma_results[[4]]
+simul_consensus_heatmap <- simul_bma_results[[7]]
+
+# save cluster allocations for plotting DF
+simul_data$bma_cluster_labs <- simul_bma_cluster_labels_df$alloc_ordered
+
+# save cluster allocation uncertainty for plotting DF
+simul_data$bma_cluster_uncertainty <- simul_bma_cluster_labels_df$alloc_uncertainty
+
+
+#--------
+
+# HEAT MAPS
+
+simul_km_heatmap <- pheatmap::pheatmap(simul_km_similarity, treeheight_row = 0, treeheight_col = 0, main = paste("a) k-means - Weight = ",round(simul_bma_weights_df$W_m[1],2),sep=""))
+simul_km_heatmap
+simul_hc_heatmap <- pheatmap::pheatmap(simul_hc_similarity, treeheight_row = 0, treeheight_col = 0, main = paste("b) Hierarchical Clustering - Weight = ",round(simul_bma_weights_df$W_m[2],2),sep=""))
+simul_hc_heatmap
+simul_gmm_heatmap <- pheatmap::pheatmap(simul_gmm_similarity, treeheight_row = 0, treeheight_col = 0, main = paste("c) Gaussian Mixture Model - Weight = ",round(simul_bma_weights_df$W_m[3],2),sep=""))
+simul_gmm_heatmap
+
+#---------
+
+# Save sim study heatmaps 
+
+png(paste(separation_level,"heatmaps_sim_110722.png"),width=1000,height=1000,pointsize=22)
+grid.arrange(simul_km_heatmap[[4]],simul_hc_heatmap[[4]],simul_gmm_heatmap[[4]],simul_consensus_heatmap[[4]],nrow=2, ncol=2)
+dev.off()
+
+
+
+
+
+
+
+#-------
+# PLOT RESULTS OF EACH ALGORITHM
+
+# add labels to data frame
+simul_data$km_simul_labs <- km_simul_labs
+simul_data$hc_simul_labs <- hc_simul_labs
+simul_data$gmm_simul_labs <- gmm_simul_labs
+
+
+km_plot <- plot_ly(data=simul_data,x=simul_data[,1],y=simul_data[,2],color=factor(simul_data$km_simul_labs),colors = RColorBrewer::brewer.pal(NC,"Dark2"),marker=list(sizeref=0.3, sizemode="area"))
+
+km_plot <- km_plot %>% layout(
+  title=paste("K-means clusters - ",separation_level,sep=""),
+        scene = list(
+      xaxis = list(title = ""),#,range = c(-2.5,2.5)),
+      yaxis = list(title = ""),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "")#,range = c(-2.5,2.5))
+    ))
+
+print(km_plot)
+
+#HC plot
+
+hc_plot <- plot_ly(data=simul_data,x=simul_data[,1],y=simul_data[,2],color=factor(simul_data$hc_simul_labs),colors = RColorBrewer::brewer.pal(NC,"Dark2"),marker=list(sizeref=0.3, sizemode="area"))
+
+hc_plot <- hc_plot %>% layout(
+  title=paste("HC clusters - ",separation_level,sep=""),
+        scene = list(
+      xaxis = list(title = ""),#,range = c(-2.5,2.5)),
+      yaxis = list(title = ""),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "")#,range = c(-2.5,2.5))
+    ))
+
+print(hc_plot)
+
+#GMM Plot
+
+gmm_plot <- plot_ly(data=simul_data,x=simul_data[,1],y=simul_data[,2],color=factor(simul_data$gmm_simul_labs),colors = RColorBrewer::brewer.pal(NC,"Dark2"),marker=list(sizeref=0.3, sizemode="area"))
+
+gmm_plot <- gmm_plot %>% layout(
+  title=paste("GMM clusters - ",separation_level,sep=""),
+        scene = list(
+      xaxis = list(title = ""),#,range = c(-2.5,2.5)),
+      yaxis = list(title = ""),#,range = c(-2.5,2.5)),
+      zaxis = list(title = "")#,range = c(-2.5,2.5))
+    ))
+
+print(gmm_plot)
+
+
+
+
+
+#---------
+
+
+simul_BMA_size_uncertainty <- ggplot(data=simul_data,aes(x=simul_data[,1],y=simul_data[,2])) + geom_point(aes(color=as.factor(bma_cluster_labs),size=simul_data$bma_cluster_uncertainty))+ 
+  scale_colour_manual(values=RColorBrewer::brewer.pal(5,"Dark2"))+
+  labs(color = "Cluster", title="BMA Clusters") + 
+  xlab("PC1")+ 
+  ylab("PC2")+
+  guides(size = "none")+
+  ggtitle(paste("BMA clusters - ",separation_level,sep="")) + theme_bw()
+
+# simul_BMA_size_uncertainty <- plot_ly(data=simul_data,x=simul_data[,1],y=simul_data[,2],color=factor(simul_data$bma_cluster_labs),colors = RColorBrewer::brewer.pal(NC,"Dark2"), size=simul_data$bma_cluster_uncertainty,marker=list(sizeref=0.3, sizemode="area"))
+# 
+# simul_BMA_size_uncertainty <- simul_BMA_size_uncertainty %>% layout(
+#   title=paste("BMA clusters - ",separation_level,sep=""),
+#         scene = list(
+#       xaxis = list(title = ""),#,range = c(-2.5,2.5)),
+#       yaxis = list(title = ""),#,range = c(-2.5,2.5)),
+#       zaxis = list(title = "")#,range = c(-2.5,2.5))
+#     ))
+
+
+
+
+print(simul_bma_results[4]) #show table
+
+print(simul_BMA_size_uncertainty) #show plot
+
+print(simul_bma_weights_df$W_m)
+
+return(list(simul_bma_weights_df,simul_BMA_size_uncertainty,simul_bma_results[4],simul_bma_weights_df$W_m))
+  
+}
+
+```
+
+
+```{r}
+
+far_pipeline <- simul_pipeline(simul_far_df,NC=5,separation_level = "High separation")
+far_pipeline
+```
+
+```{r}
+
+mid_pipeline <- simul_pipeline(simul_mid_df,NC=5,separation_level = "Medium separation")
+mid_pipeline
+```
+
+```{r}
+
+close_pipeline <- simul_pipeline(simul_close_df,NC=5,separation_level="Low separation")
+close_pipeline
+```
+# Save ggplots of simulated BMA results, ucnertainty x size
+```{r}
+
+far_fix <- far_pipeline[[2]] + ggtitle("a) BMA clusters - High separation")
+mid_fix <- mid_pipeline[[2]] + ggtitle("b) BMA clusters - Medium separation")
+close_fix <- close_pipeline[[2]] + ggtitle("c) BMA clusters - Low separation")
+
+png("sim_bma_plots_110722.png",width=600,height=1500,pointsize=22)
+grid.arrange(far_fix,mid_fix,close_fix,nrow=3, ncol=1)
+dev.off()
+
+
+tiff("sim_bma_plots_110722.tif", compression = "lzw",width = 600, height = 1500, pointsize = 22)
+grid.arrange(far_fix,mid_fix,close_fix,nrow=3, ncol=1)
+dev.off() 
+
+
+```
+
+
+
+# Simulation study 3 - different K across algorithms
+
+
+
+```{r}
+
+
+
+ #  simul_data_diff_k_gen <- clusterGeneration::genRandomClust(numClust=3,sepVal=-0.3,numNonNoisy=2,numNoisy=0,clustSizes=c(rep(100,3)),numReplicate = 1,clustszind = 3)
+ # 
+ #  simul_diff_k_data <- data.frame(simul_data_diff_k_gen$datList$test_1)
+ #  
+ # save(simul_diff_k_data,file="simul_diff_k_data_270722")
+
+
+  load("simul_diff_k_data_270722")
+
+  km_simul_3 <- kmeans(simul_diff_k_data,centers=3)
+  km_simul_3_labs <- km_simul_3$cluster
+  
+  hc_simul_5 <- hclust(dist(simul_diff_k_data),method="ward.D2")
+  hc_simul_5_labs <- cutree(hc_simul_5,k=2)
+  
+  
+  simul_diff_k_cluster_labels_df <- data.frame(km_simul_3_labs,hc_simul_5_labs)
+  
+#case study - hard clusters to CLUSTER PROBABILITY MATRICES
+simul_km_3_prob <- hard_to_prob_fn(km_simul_3_labs,3)
+simul_hc_5_prob <- hard_to_prob_fn(hc_simul_5_labs,2)
+
+
+# Compute SIMILARITY MATRICES
+
+simul_km_3_similarity <- sim_mat_fn(simul_km_3_prob)
+simul_hc_5_similarity <- sim_mat_fn(simul_hc_5_prob)
+
+simul_diff_k_sim_mats_list <- list(simul_km_3_similarity,simul_hc_5_similarity)
+
+
+
+
+
+#-------
+
+# calculate bma weights (CH, XB, etc) for each
+simul_diff_k_bma_weights_df <- ch_xb_weight_fn(input_data=simul_diff_k_data,cluster_label_df = simul_diff_k_cluster_labels_df,n_sols = 2)
+
+
+
+
+simul_diff_k_bma_results <- consensus_matrix_fn(sim_mat_list = simul_diff_k_sim_mats_list,algo_weights=simul_diff_k_bma_weights_df$W_m,n_final_clust=3)
+
+
+simul_diff_k_consensus_matrix <- simul_diff_k_bma_results[[1]]
+simul_diff_k_bma_cluster_labels_df <- simul_diff_k_bma_results[[3]]
+simul_diff_k_consensus_table <- simul_diff_k_bma_results[[4]]
+simul_diff_k_consensus_heatmap <- simul_diff_k_bma_results[[5]]
+
+# save cluster allocations for plotting DF
+simul_diff_k_data$bma_cluster_labs <- simul_diff_k_bma_cluster_labels_df$alloc_ordered
+
+# save cluster allocation uncertainty for plotting DF
+simul_diff_k_data$bma_cluster_uncertainty <- simul_diff_k_bma_cluster_labels_df$alloc_uncertainty
+
+
+#--------
+
+# # HEAT MAPS
+# 
+# simul_km_heatmap <- pheatmap::pheatmap(simul_km_similarity, treeheight_row = 0, treeheight_col = 0, main = paste("a) k-means - Weight = ",round(simul_bma_weights_df$W_m[1],2),sep=""))
+# simul_km_heatmap
+# simul_hc_heatmap <- pheatmap::pheatmap(simul_hc_similarity, treeheight_row = 0, treeheight_col = 0, main = paste("b) Hierarchical Clustering - Weight = ",round(simul_bma_weights_df$W_m[2],2),sep=""))
+# simul_hc_heatmap
+# simul_gmm_heatmap <- pheatmap::pheatmap(simul_gmm_similarity, treeheight_row = 0, treeheight_col = 0, main = paste("c) Gaussian Mixture Model - Weight = ",round(simul_bma_weights_df$W_m[3],2),sep=""))
+# simul_gmm_heatmap
+# 
+# #---------
+
+# Save sim study heatmaps 
+# 
+# png(paste(separation_level,"heatmaps_sim_110722.png"),width=1000,height=1000,pointsize=22)
+# grid.arrange(simul_km_heatmap[[4]],simul_hc_heatmap[[4]],simul_gmm_heatmap[[4]],simul_consensus_heatmap[[4]],nrow=2, ncol=2)
+# dev.off()
+
+
+
+
+
+
+
+#-------
+# PLOT RESULTS OF EACH ALGORITHM
+
+# add labels to data frame
+simul_diff_k_data$km_simul_labs <- km_simul_3_labs
+simul_diff_k_data$hc_simul_labs <- hc_simul_5_labs
+
+
+# Switch 1 and 2 in HC for consistent plotting
+swap <- function(vec, from, to) {
+  tmp <- to[ match(vec, from) ]
+  tmp[is.na(tmp)] <- vec[is.na(tmp)]
+  return(tmp)
+}
+simul_diff_k_data$hc_simul_lab_switch <- swap(simul_diff_k_data$hc_simul_labs,c(1,2),c(2,1))
+
+simul_diff_k_data$km_simul_labs_switch <- swap(simul_diff_k_data$km_simul_labs,c(1,3),c(3,1))
+
+
+# 
+# 
+# km_3_plot <- plot_ly(data=simul_diff_k_data,x=simul_diff_k_data[,1],y=simul_diff_k_data[,2],color=factor(simul_diff_k_data$km_simul_labs),colors = RColorBrewer::brewer.pal(5,"Dark2"),marker=list(sizeref=0.3, sizemode="area"))
+# 
+# km_3_plot <- km_3_plot %>% layout(
+#   title="K-means clusters - K = 3",
+#         scene = list(
+#       xaxis = list(title = ""),#,range = c(-2.5,2.5)),
+#       yaxis = list(title = ""),#,range = c(-2.5,2.5)),
+#       zaxis = list(title = "")#,range = c(-2.5,2.5))
+#     ))
+# 
+# print(km_3_plot)
+
+#HC plot
+# 
+# hc_5_plot <- plot_ly(data=simul_diff_k_data,x=simul_diff_k_data[,1],y=simul_diff_k_data[,2],color=factor(simul_diff_k_data$hc_simul_labs),colors = RColorBrewer::brewer.pal(3,"Dark2"),marker=list(sizeref=0.3, sizemode="area"))
+# 
+# hc_5_plot <- hc_5_plot %>% layout(
+#   title="HC clusters - K = 5",
+#         scene = list(
+#       xaxis = list(title = ""),#,range = c(-2.5,2.5)),
+#       yaxis = list(title = ""),#,range = c(-2.5,2.5)),
+#       zaxis = list(title = "")#,range = c(-2.5,2.5))
+#     ))
+# 
+# print(hc_5_plot)
+
+
+
+km_3_plot <- ggplot(data=simul_diff_k_data,aes(x=simul_diff_k_data[,1],y=simul_diff_k_data[,2])) + geom_point(aes(color=as.factor(km_simul_labs_switch)))+ 
+  scale_colour_manual(values=RColorBrewer::brewer.pal(3,"Dark2"))+
+  labs(color = "Cluster", title="k-means Clusters") + 
+  xlab(" ")+ 
+  ylab(" ")+
+  guides(size = "none")+
+  ggtitle(paste("a) k-means - K = 3. Weight = 0.664"))+ theme_bw(base_size=18)+  scale_size(range = c(2,2))
+
+
+km_3_plot
+
+hc_2_plot <- ggplot(data=simul_diff_k_data,aes(x=simul_diff_k_data[,1],y=simul_diff_k_data[,2])) + geom_point(aes(color=as.factor(hc_simul_lab_switch)))+ 
+  scale_colour_manual(values=RColorBrewer::brewer.pal(2,"Dark2"))+
+  labs(color = "Cluster", title="k-means Clusters") + 
+  xlab(" ")+ 
+  ylab(" ")+
+  guides(size = "none")+
+  ggtitle(paste("b) Hierarchical Clustering - K = 2. Weight = 0.336")) + theme_bw(base_size=18) +  scale_size(range = c(2,2))
+
+
+hc_2_plot
+
+
+
+
+#---------
+
+
+simul_diff_k_BMA_size_uncertainty <- ggplot(data=simul_diff_k_data,aes(x=simul_diff_k_data[,1],y=simul_diff_k_data[,2])) + geom_point(aes(color=as.factor(bma_cluster_labs),size=simul_diff_k_data$bma_cluster_uncertainty))+ 
+  scale_colour_manual(values=viridis(3))+
+  labs(color = "Cluster", title="BMA Clusters") + 
+  xlab(" ")+ 
+  ylab(" ")+
+  guides(size = "none")+
+  ggtitle(paste("c) BMA clusters - K = 3"))+
+  scale_size_continuous(range = c(1,8))+
+  theme_bw(base_size=18)
+
+simul_diff_k_BMA_size_uncertainty
+
+
+
+
+print(simul_diff_k_bma_results[4]) #show weights
+
+print(simul_diff_k_bma_results[2]) #show allocation probabilities
+
+
+print(simul_diff_k_BMA_size_uncertainty) #show plot
+
+print(simul_diff_k_bma_weights_df$W_m)
+
+#return(list(simul_bma_weights_df,simul_BMA_size_uncertainty,simul_bma_results[4],simul_bma_weights_df$W_m))
+
+
+
+png("diffk_km3_270722.png",width=550,height=500,pointsize=10)
+km_3_plot
+dev.off()
+
+png("diffk_hc2_270722.png",width=550,height=500,pointsize=10)
+hc_2_plot
+dev.off()
+
+png("diffk_BMA_270722.png",width=550,height=500,pointsize=10)
+simul_diff_k_BMA_size_uncertainty
+dev.off()
+  
+
+```
+
